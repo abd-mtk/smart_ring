@@ -14,6 +14,9 @@ import io.flutter.plugin.common.MethodCall;
 import io.flutter.plugin.common.MethodChannel;
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler;
 import io.flutter.plugin.common.MethodChannel.Result;
+import io.flutter.plugin.common.EventChannel;
+import io.flutter.plugin.common.EventChannel.EventSink;
+import io.flutter.plugin.common.EventChannel.StreamHandler;
 
 import com.crrepa.ble.CRPBleClient;
 import com.crrepa.ble.conn.CRPBleConnection;
@@ -35,7 +38,6 @@ import com.crrepa.ble.conn.listener.CRPHeartRateChangeListener;
 import com.crrepa.ble.conn.listener.CRPHrvChangeListener;
 import com.crrepa.ble.conn.listener.CRPStressChangeListener;
 import com.crrepa.ble.conn.listener.CRPTempChangeListener;
-import com.crrepa.ble.conn.type.CRPHistoryDay;
 import android.os.Handler;
 import android.os.Looper;
 
@@ -44,6 +46,8 @@ public class SmartRingPlugin implements FlutterPlugin, MethodCallHandler {
     private CRPBleClient bleClient;
     private CRPScanCallback scanCallback;
     private MethodChannel channel;
+    private EventChannel eventChannel;
+    private EventSink eventSink;
     private Context context;
     private CRPBleConnection bleConnection;
     private double lastNonNullTemperature = 0.0;
@@ -340,14 +344,26 @@ public class SmartRingPlugin implements FlutterPlugin, MethodCallHandler {
         new Handler(Looper.getMainLooper()).post(new Runnable() {
             @Override
             public void run() {
-                if (channel == null) {
-                    Log.w(TAG, "Channel is null, cannot send event: " + eventName);
-                    return;
-                }
-                try {
-                    channel.invokeMethod(eventName, dataToSend);
-                } catch (Exception e) {
-                    Log.e(TAG, "Error sending to Flutter: " + e.getMessage());
+                if (eventSink != null) {
+                    try {
+                        Map<String, Object> event = new HashMap<>();
+                        event.put("event", eventName);
+                        event.put("data", dataToSend);
+                        eventSink.success(event);
+                    } catch (Exception e) {
+                        Log.e(TAG, "Error sending event to Flutter: " + e.getMessage());
+                    }
+                } else {
+                    // Fallback to method channel for backward compatibility
+                    if (channel != null) {
+                        try {
+                            channel.invokeMethod(eventName, dataToSend);
+                        } catch (Exception e) {
+                            Log.e(TAG, "Error sending to Flutter: " + e.getMessage());
+                        }
+                    } else {
+                        Log.w(TAG, "Event sink and channel are null, cannot send event: " + eventName);
+                    }
                 }
             }
         });
@@ -456,9 +472,11 @@ public class SmartRingPlugin implements FlutterPlugin, MethodCallHandler {
                 public void onScanning(CRPScanDevice device) {
                     try {
                         Map<String, String> deviceData = new HashMap<>();
-                        deviceData.put("name", device.getDevice().getName());
-                        deviceData.put("address", device.getDevice().getAddress());
-                        channel.invokeMethod("onDeviceScanned", deviceData);
+                        String deviceName = device.getDevice().getName();
+                        String deviceAddress = device.getDevice().getAddress();
+                        deviceData.put("name", deviceName != null ? deviceName : "Unknown");
+                        deviceData.put("address", deviceAddress != null ? deviceAddress : "");
+                        sendToFlutter("onDeviceScanned", new JSONObject(deviceData).toString());
                     } catch (Exception e) {
                         Log.e(TAG, "Error processing scanned device: " + e.getMessage());
                     }
@@ -466,7 +484,7 @@ public class SmartRingPlugin implements FlutterPlugin, MethodCallHandler {
 
                 @Override
                 public void onScanComplete(List<CRPScanDevice> list) {
-                    channel.invokeMethod("onScanComplete", null);
+                    sendToFlutter("onScanComplete", "true");
                 }
             };
             bleClient.scanDevice(scanCallback, 30000);
@@ -529,9 +547,6 @@ public class SmartRingPlugin implements FlutterPlugin, MethodCallHandler {
             sendMeasurementStatusUpdate(); // Send status AFTER setting the flag
             try {
                 bleConnection.enableTimingTemp();
-                CRPHistoryDay historyDay = CRPHistoryDay.TODAY;
-                bleConnection.queryHistoryTemp(historyDay);
-                
                 // Set timeout
                 timeoutHandler.postDelayed(new Runnable() {
                     @Override
@@ -605,7 +620,6 @@ public class SmartRingPlugin implements FlutterPlugin, MethodCallHandler {
             sendMeasurementStatusUpdate(); // Send status AFTER setting the flag
             try {
                 bleConnection.startMeasureHeartRate();
-                
                 // Set timeout
                 timeoutHandler.postDelayed(new Runnable() {
                     @Override
@@ -868,16 +882,17 @@ public class SmartRingPlugin implements FlutterPlugin, MethodCallHandler {
         public void onHistoryTempChange(CRPHistoryTempInfo tempInfo) {
             try {
                 List<Float> tempList = tempInfo.getTempList();
-                Log.d(TAG, "Temperature history: " + 
+                Log.d(TAG, "Temperature measurement received: " + 
                       tempList.stream().map(String::valueOf).collect(Collectors.joining(",")));
 
                 // Cancel timeout since we got a response
                 timeoutHandler.removeCallbacksAndMessages(null);
 
-                Float firstValidTemperature = null;
+                // Get the first valid temperature reading (current measurement)
+                Float currentTemperature = null;
                 for (Float temperature : tempList) {
                     if (temperature != null && temperature != 0.0f) {
-                        firstValidTemperature = temperature;
+                        currentTemperature = temperature;
                         lastNonNullTemperature = temperature;
                         break;
                     }
@@ -892,8 +907,8 @@ public class SmartRingPlugin implements FlutterPlugin, MethodCallHandler {
                 isMeasuringTemperature = false;
                 sendMeasurementStatusUpdate();
 
-                if (firstValidTemperature != null) {
-                    sendToFlutter("bodyTemperature", String.format("%.1f", firstValidTemperature));
+                if (currentTemperature != null) {
+                    sendToFlutter("bodyTemperature", String.format("%.1f", currentTemperature));
                     
                     if (isFullMeasurementInProgress) {
                         proceedToNextMeasurement();
@@ -903,18 +918,10 @@ public class SmartRingPlugin implements FlutterPlugin, MethodCallHandler {
                     if ("temperature".equals(currentRetryType)) {
                         retryMeasurement("temperature", isFullMeasurementInProgress);
                     } else {
-                        // If we have a previous valid temperature reading, use that
-                        if (lastNonNullTemperature > 0) {
-                            sendToFlutter("bodyTemperature", String.format("%.1f", lastNonNullTemperature));
-                            if (isFullMeasurementInProgress) {
-                                proceedToNextMeasurement();
-                            }
-                        } else {
-                            sendToFlutter("measurementError", createErrorJson("temperature", "No valid temperature reading"));
-                            
-                            if (isFullMeasurementInProgress) {
-                                handleSequenceFailure("temperature");
-                            }
+                        sendToFlutter("measurementError", createErrorJson("temperature", "No valid temperature reading"));
+                        
+                        if (isFullMeasurementInProgress) {
+                            handleSequenceFailure("temperature");
                         }
                     }
                 }
@@ -1136,8 +1143,23 @@ public class SmartRingPlugin implements FlutterPlugin, MethodCallHandler {
     @Override
     public void onAttachedToEngine(@NonNull FlutterPluginBinding flutterPluginBinding) {
         channel = new MethodChannel(flutterPluginBinding.getBinaryMessenger(), "smart_ring");
+        eventChannel = new EventChannel(flutterPluginBinding.getBinaryMessenger(), "smart_ring_events");
         context = flutterPluginBinding.getApplicationContext();
         channel.setMethodCallHandler(this);
+        
+        eventChannel.setStreamHandler(new StreamHandler() {
+            @Override
+            public void onListen(Object arguments, EventSink events) {
+                eventSink = events;
+                Log.d(TAG, "Event channel listener attached");
+            }
+
+            @Override
+            public void onCancel(Object arguments) {
+                eventSink = null;
+                Log.d(TAG, "Event channel listener cancelled");
+            }
+        });
     }
 
     @Override
@@ -1148,7 +1170,10 @@ public class SmartRingPlugin implements FlutterPlugin, MethodCallHandler {
         }
         cleanupResources();
         channel.setMethodCallHandler(null);
+        eventChannel.setStreamHandler(null);
         channel = null;
+        eventChannel = null;
+        eventSink = null;
         context = null;
     }
 }
