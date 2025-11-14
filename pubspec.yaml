@@ -1,7 +1,8 @@
 name: smart_ring
-description: "A new Flutter plugin project."
+description: A Flutter plugin for connecting and interacting with smart ring devices via Bluetooth Low Energy (BLE).
 version: 0.0.1
-homepage:
+homepage: https://github.com/YOUR_USERNAME/smart_ring
+repository: https://github.com/YOUR_USERNAME/smart_ring
 
 environment:
   sdk: ^3.9.2
